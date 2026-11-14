@@ -92,7 +92,7 @@ const HAZARD: Record<string, number[]> = {
 };
 /** How many rating points one unit of refusal risk is worth: a call is only worth making while the
  * model it buys is at least this much stronger than the next safe one. Fixed, so reruns agree. */
-const HAZARD_WEIGHT = 80;
+const HAZARD_WEIGHT = 240;
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
