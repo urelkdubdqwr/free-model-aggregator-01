@@ -69,7 +69,30 @@ const CALL_TIMEOUT_MS = 20000;
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
 /** A provider with this many refusals on the trial is treated as spent and is tried only as a last resort. */
 const DEAD_AFTER = 3;
-// A spent provider is still tried (last) once every healthy candidate has failed.
+
+/**
+ * P(the next call to a provider is refused), from the free tiers' published sizes: index = calls already
+ * made this trial, so HAZARD[p][k] prices call k+1. Each provider's real budget is uniform over its
+ * tier's range and its refusals are 1-2 calls inside it, so a call is safe at number 1, risky from 2,
+ * and certain to fail once the tier's floor is reached — the tail of 1.0 marks a provider that is spent.
+ * The entry ships no unknown-tier guess beyond a single last-resort default, and the numbers are a fixed
+ * table: a replayed trial reads the same table and prices the same calls.
+ */
+const HAZARD: Record<string, number[]> = {
+  groq: [0, 0.192, 0.2077, 0.2327, 0.2625, 0.297, 0.3723, 0.4701, 0.5543, 0.6781, 1, 1, 1, 1, 1, 1, 1],
+  cerebras: [0, 0.4556, 0.5729, 0.7477, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+  gemini: [0, 0.3245, 0.3788, 0.4641, 0.5784, 0.7273, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+  zai: [0, 0.6388, 0.7797, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+  openrouter: [0, 0.1791, 0.1972, 0.2143, 0.2376, 0.2787, 0.3243, 0.4018, 0.5621, 0.7272, 1, 1, 1, 1, 1, 1, 1],
+  sambanova: [0, 0.6414, 0.7788, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+  pollinations: [0, 0.1589, 0.1739, 0.1895, 0.2114, 0.234, 0.2772, 0.3225, 0.3965, 0.4525, 0.5277, 0.7077, 1, 1, 1, 1, 1],
+  cloudflare: [0, 0.2901, 0.3396, 0.4081, 0.5058, 0.7313, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+  ovh: [0, 0.4538, 0.5679, 0.7534, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+  kilol: [0, 0.1373, 0.145, 0.1545, 0.1705, 0.1819, 0.1983, 0.2206, 0.2647, 0.306, 0.3879, 0.4274, 0.5497, 0.6808, 1, 1, 1],
+};
+/** How many rating points one unit of refusal risk is worth: a call is only worth making while the
+ * model it buys is at least this much stronger than the next safe one. Fixed, so reruns agree. */
+const HAZARD_WEIGHT = 80;
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
@@ -81,6 +104,8 @@ let catalog: CatalogReport = { providers: [] };
 let manifestIndex = 0;
 /** How many times each provider has refused a call so far in this trial. */
 const refusals = new Map<string, number>();
+/** How many calls have been sent to each provider so far in this trial: HAZARD's index. */
+const calls = new Map<string, number>();
 
 function log(message: string): void {
   process.stderr.write(`aggregator: ${message}\n`);
@@ -222,6 +247,7 @@ function providerBody(provider: ProviderDirectoryEntry, internal: Json, modelId:
 
 /** One provider call; the parsed answer, or null when the provider refused or failed. */
 async function callProvider(provider: ProviderDirectoryEntry, body: Json, modelId: string): Promise<InternalAnswer | null> {
+  calls.set(provider.id, (calls.get(provider.id) ?? 0) + 1);
   const headers: Record<string, string> = { 'content-type': 'application/json', ...authHeaders(provider.auth, provider.key) };
   if (provider.wire === 'anthropic') headers['anthropic-version'] = '2023-06-01';
   let res: Response;
@@ -258,18 +284,35 @@ function spent(provider: ProviderDirectoryEntry): boolean {
   return (refusals.get(provider.id) ?? 0) >= DEAD_AFTER;
 }
 
+/** P(a provider's next call is refused), priced from its tier's size and the calls sent so far. */
+function hazardOf(providerId: string, callsMade: number): number {
+  const table = HAZARD[providerId];
+  if (table === undefined) return 1;
+  return callsMade < table.length ? table[callsMade] : 1;
+}
+
 /**
- * Answer one client request: try the strongest free candidate that meets the requirements, then the
- * next, counting each refusal and stopping at the first provider that answers. Spent providers sort
- * last, so a healthy model is tried first while a provider with failures is still a last resort.
+ * Answer one client request. The candidates are ordered by hazard-priced rating: a model's rating
+ * minus HAZARD_WEIGHT times the chance the call that reaches it is refused. So the strongest free
+ * model is still first while its provider is fresh, and as a provider's tier fills up (or it refuses)
+ * the next-strongest model on an unspent provider overtakes it — the router spends calls where they
+ * are still likely to land, rather than walking a spent tier model by model. Providers certain to
+ * refuse sort out entirely, and are kept only as a last resort once they all would.
  */
 async function serve(api: 'openai' | 'anthropic', body: Json): Promise<InternalAnswer | null> {
   const internal = api === 'anthropic' ? anthropicRequestToOpenAI(body, 'auto') : body;
   const requires = nextRequirements(body);
   const needJsonEcho = api === 'openai' && asksForJson(body);
   const list = candidatesFor(requires, needJsonEcho);
-  const order = [...list].sort((a, b) => Number(spent(a.provider)) - Number(spent(b.provider)));
-  for (const candidate of order) {
+  const priced = (a: Candidate, b: Candidate): number => {
+    const ar = a.rating - HAZARD_WEIGHT * hazardOf(a.provider.id, calls.get(a.provider.id) ?? 0);
+    const br = b.rating - HAZARD_WEIGHT * hazardOf(b.provider.id, calls.get(b.provider.id) ?? 0);
+    return br - ar || b.rating - a.rating || (a.provider.id < b.provider.id ? -1 : a.provider.id > b.provider.id ? 1 : 0) || (a.model.id < b.model.id ? -1 : a.model.id > b.model.id ? 1 : 0);
+  };
+  const order = [...list].sort(priced);
+  const live = order.filter((candidate) => hazardOf(candidate.provider.id, calls.get(candidate.provider.id) ?? 0) < 1);
+  const seq = live.length > 0 ? live : order;
+  for (const candidate of seq) {
     const answer = await callProvider(candidate.provider, providerBody(candidate.provider, internal, candidate.model.id), candidate.model.id);
     if (answer !== null) return answer;
   }
