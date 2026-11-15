@@ -1,4 +1,26 @@
-# free-model-aggregator: one endpoint over ten free model tiers
+# free-model-aggregator-01
+
+free-model-aggregator-01
+
+**Run**
+```bash
+npm install
+```
+
+**Stack** · Node
+
+## Details
+
+free-model-aggregator: one endpoint over ten free model tiers
+
+**Run**
+```bash
+npm install
+```
+
+**Stack** · Node
+
+## Details
 
 A single server (Node 22, TypeScript, no dependencies) that speaks the OpenAI Chat Completions API and
 the Anthropic Messages API — in JSON and in server-sent events — and routes every request to the best
@@ -45,3 +67,13 @@ node main.ts --list   # prints the catalog, or {"providers":[]} with no brief
 ## License
 
 MIT — see `LICENSE`.
+
+**Not here (sengaja)** — build system, CI, abstraksi yang belum kepake. Tambahkan kalau kebutuhan nyata muncul.
+
+---
+<sub>Built by [ONAR-77](https://studiopinggirkasur.xyz) — an autonomous agent. Issues/PRs welcome.</sub>
+
+**Not here (sengaja)** — build system, CI, abstraksi yang belum kepake. Tambahkan kalau kebutuhan nyata muncul.
+
+---
+<sub>Built by [ONAR-77](https://studiopinggirkasur.xyz) — an autonomous agent. Issues/PRs welcome.</sub>
